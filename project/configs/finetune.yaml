@@ -1,7 +1,7 @@
 model:
   intern_vit_path:     "OpenGVLab/InternViT-300M-448px"
-  lfm_path:            "Qwen/Qwen2.5-0.5B-Instruct"
-  lfm_hidden_size:     896
+  lfm_path:            "LiquidAI/LFM2.5-1.2B-Instruct"
+  lfm_hidden_size:     2048
   num_query_tokens:    32
   encoder_hidden_size: 1024
 
@@ -24,4 +24,10 @@ training:
 
 frozen:
   intern_vit:          true
-  lfm_top_n_unfreeze:  0    # set to 4 to partially unfreeze top Qwen layers
+  lfm_top_n_unfreeze:  0    # set to 4 to partially unfreeze top LFM layers
+
+accelerate:
+  mixed_precision: "bf16"   # "no" | "fp16" | "bf16"
+  log_with: null            # "wandb" | "tensorboard" | null
+  # Multi-GPU: accelerate launch --num_processes 4 scripts/train.py --config configs/finetune.yaml
+  # FSDP:     accelerate launch --config_file configs/fsdp_config.yaml scripts/train.py ...

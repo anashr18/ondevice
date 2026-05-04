@@ -1,58 +1,46 @@
 import torch
-from torch.cuda.amp import autocast, GradScaler
+from accelerate import Accelerator
 
 
 def train_one_epoch(
+    accelerator: Accelerator,
     model,
     loader,
     optimizer,
     scheduler,
-    scaler: GradScaler,
-    accum_steps: int = 4,
-    device: str = "cuda",
     epoch: int = 0,
 ) -> float:
     model.train()
     total_loss   = 0.0
     total_tokens = 0
     opt_step     = 0
-    optimizer.zero_grad()
 
     for step, batch in enumerate(loader):
-        pixel_values   = batch["pixel_values"].to(device)
-        n_tiles_list   = batch["n_tiles_list"]
-        input_ids      = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels         = batch["labels"].to(device)
-
-        with autocast(dtype=torch.bfloat16):
+        with accelerator.accumulate(model):
             loss = model(
-                pixel_values=pixel_values,
-                n_tiles_list=n_tiles_list,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                device=device,
+                pixel_values=batch["pixel_values"],
+                n_tiles_list=batch["n_tiles_list"],
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                labels=batch["labels"],
+                device=accelerator.device,
             )
-
-        n_tokens     = (labels != -100).sum().item()
-        total_loss   += loss.item() * n_tokens
-        total_tokens += n_tokens
-
-        scaler.scale(loss / accum_steps).backward()
-
-        if (step + 1) % accum_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad], 1.0
-            )
-            scaler.step(optimizer)
-            scaler.update()
+            accelerator.backward(loss)
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad], 1.0
+                )
+            optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
-            opt_step += 1
 
-            if opt_step % 20 == 0:
+        n_tokens = (batch["labels"] != -100).sum().item()
+        total_loss   += loss.detach().float().item() * n_tokens
+        total_tokens += n_tokens
+
+        if accelerator.sync_gradients:
+            opt_step += 1
+            if opt_step % 20 == 0 and accelerator.is_main_process:
                 avg = total_loss / max(total_tokens, 1)
                 lr  = scheduler.get_last_lr()[0]
                 print(f"epoch={epoch} opt_step={opt_step} loss={avg:.4f} lr={lr:.2e}")
@@ -61,30 +49,28 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def evaluate(model, loader, device: str = "cuda") -> float:
+def evaluate(accelerator: Accelerator, model, loader) -> float:
     model.eval()
     total_loss   = 0.0
     total_tokens = 0
 
     for batch in loader:
-        pixel_values   = batch["pixel_values"].to(device)
-        n_tiles_list   = batch["n_tiles_list"]
-        input_ids      = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels         = batch["labels"].to(device)
-
-        with autocast(dtype=torch.bfloat16):
-            loss = model(
-                pixel_values=pixel_values,
-                n_tiles_list=n_tiles_list,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                device=device,
-            )
-
-        n_tokens     = (labels != -100).sum().item()
-        total_loss   += loss.item() * n_tokens
+        loss = model(
+            pixel_values=batch["pixel_values"],
+            n_tiles_list=batch["n_tiles_list"],
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            labels=batch["labels"],
+            device=accelerator.device,
+        )
+        n_tokens = (batch["labels"] != -100).sum().item()
+        total_loss   += loss.detach().float().item() * n_tokens
         total_tokens += n_tokens
 
-    return total_loss / max(total_tokens, 1)
+    # Gather across GPUs
+    total_loss_t   = torch.tensor(total_loss,   device=accelerator.device)
+    total_tokens_t = torch.tensor(total_tokens, device=accelerator.device)
+    total_loss_t   = accelerator.gather(total_loss_t).sum().item()
+    total_tokens_t = accelerator.gather(total_tokens_t).sum().item()
+
+    return total_loss_t / max(total_tokens_t, 1)

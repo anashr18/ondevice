@@ -11,10 +11,10 @@ class InternViTQFormerLFM(nn.Module):
     def __init__(
         self,
         intern_vit_path: str = "OpenGVLab/InternViT-300M-448px",
-        lfm_path: str = "Qwen/Qwen2.5-0.5B-Instruct",
+        lfm_path: str = "LiquidAI/LFM2.5-1.2B-Instruct",
         num_query_tokens: int = 32,
         encoder_hidden_size: int = 1024,
-        lfm_hidden_size: int = 896,
+        lfm_hidden_size: int = 2048,
         lfm_top_n_unfreeze: int = 0,
     ):
         super().__init__()
@@ -36,10 +36,25 @@ class InternViTQFormerLFM(nn.Module):
             param.requires_grad = False
 
         if lfm_top_n_unfreeze > 0:
-            layers = self.lfm.model.layers
-            for layer in layers[-lfm_top_n_unfreeze:]:
+            # LFM2 hybrid model: layers attr may sit at model.model.layers or model.model.blocks
+            inner = getattr(self.lfm, "model", self.lfm)
+            layers = getattr(inner, "layers", None) or getattr(inner, "blocks", [])
+            for layer in list(layers)[-lfm_top_n_unfreeze:]:
                 for param in layer.parameters():
                     param.requires_grad = True
+
+        # Resolve the token embedding callable once at init
+        inner = getattr(self.lfm, "model", self.lfm)
+        self._embed_tokens = (
+            getattr(inner, "embed_tokens", None)
+            or getattr(inner, "tok_embeddings", None)
+            or getattr(inner, "token_embedding", None)
+        )
+        if self._embed_tokens is None:
+            raise AttributeError(
+                f"Cannot find embedding layer in {type(self.lfm).__name__}. "
+                "Expected one of: model.embed_tokens, model.tok_embeddings, model.token_embedding"
+            )
 
         self.num_query_tokens = num_query_tokens
 
@@ -113,7 +128,7 @@ class InternViTQFormerLFM(nn.Module):
         visual_tokens = visual_tokens.to(dtype=torch.bfloat16)
 
         # Text embeddings from LFM
-        text_embeds = self.lfm.model.embed_tokens(input_ids.to(device))  # [B, L, 896]
+        text_embeds = self._embed_tokens(input_ids.to(device))  # [B, L, 896]
 
         full_input = torch.cat([visual_tokens, text_embeds], dim=1)       # [B, 32+L, 896]
         full_attn  = torch.cat([
@@ -157,7 +172,7 @@ class InternViTQFormerLFM(nn.Module):
         query_out     = qformer_out[:, :self.num_query_tokens, :]
         visual_tokens = self.language_projection(query_out).to(dtype=torch.bfloat16)
 
-        text_embeds = self.lfm.model.embed_tokens(input_ids.to(device))
+        text_embeds = self._embed_tokens(input_ids.to(device))
         full_input  = torch.cat([visual_tokens, text_embeds], dim=1)
         full_attn   = torch.cat([
             torch.ones(B, self.num_query_tokens, device=device, dtype=attention_mask.dtype),

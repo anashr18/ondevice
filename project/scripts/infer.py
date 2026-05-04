@@ -17,7 +17,7 @@ def main():
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--image",      required=True)
     parser.add_argument("--question",   required=True)
-    parser.add_argument("--lfm_path",   default="Qwen/Qwen2.5-0.5B-Instruct")
+    parser.add_argument("--lfm_path",   default="LiquidAI/LFM2.5-1.2B-Instruct")
     parser.add_argument("--max_new_tokens", type=int, default=128)
     args = parser.parse_args()
 
@@ -28,8 +28,8 @@ def main():
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     model = InternViTQFormerLFM(lfm_path=args.lfm_path).to(device)
-    ckpt  = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(ckpt["model"])
+    state_dict = torch.load(args.checkpoint, map_location=device, weights_only=True)
+    model.load_state_dict(state_dict)
     model.eval()
 
     img   = Image.open(args.image)
