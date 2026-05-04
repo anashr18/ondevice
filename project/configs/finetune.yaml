@@ -1,0 +1,27 @@
+model:
+  intern_vit_path:     "OpenGVLab/InternViT-300M-448px"
+  lfm_path:            "Qwen/Qwen2.5-0.5B-Instruct"
+  lfm_hidden_size:     896
+  num_query_tokens:    32
+  encoder_hidden_size: 1024
+
+data:
+  train_jsonl:  "data/train.jsonl"
+  val_jsonl:    "data/val.jsonl"
+  max_tiles:    6
+  max_text_len: 512
+
+training:
+  base_batch_size:       8
+  max_patches_per_batch: 15000
+  accum_steps:           4
+  lr:                    1.0e-4
+  weight_decay:          0.01
+  warmup_steps:          100
+  total_steps:           20000
+  save_every:            500
+  output_dir:            "checkpoints/finetune"
+
+frozen:
+  intern_vit:          true
+  lfm_top_n_unfreeze:  0    # set to 4 to partially unfreeze top Qwen layers

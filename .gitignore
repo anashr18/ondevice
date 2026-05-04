@@ -1,2 +1,39 @@
-optimum-executorch
-.exetorchvenv
+optimum-executorch/
+
+# Local Python environments
+.exetorchvenv/
+.venv/
+venv/
+env/
+
+# Python cache / build artifacts
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Training outputs and experiment logs
+checkpoints/
+outputs/
+runs/
+wandb/
+logs/
+
+# Local data / temp artifacts
+*.pt
+*.pth
+*.ckpt
+*.tmp
+
+# Editor / OS files
+.idea/
+.vscode/
+.DS_Store
