@@ -19,7 +19,8 @@ training:
   weight_decay:          0.01
   warmup_steps:          100
   total_steps:           20000
-  save_every:            500
+  eval_every:            500
+  log_every:             20
   output_dir:            "checkpoints/finetune"
 
 frozen:
@@ -31,3 +32,4 @@ accelerate:
   log_with: null            # "wandb" | "tensorboard" | null
   # Multi-GPU: accelerate launch --num_processes 4 scripts/train.py --config configs/finetune.yaml
   # FSDP:     accelerate launch --config_file configs/fsdp_config.yaml scripts/train.py ...
+

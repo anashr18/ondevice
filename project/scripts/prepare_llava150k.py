@@ -1,10 +1,10 @@
 
-
 import argparse
 import json
-import os
 import random
 import re
+import shutil
+import subprocess
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -19,14 +19,34 @@ LLAVA_FILENAME = "llava_instruct_150k.json"
 
 
 def _download_with_progress(url: str, dest: Path) -> None:
-    class _Bar(tqdm):
-        def update_to(self, b=1, bsize=1, tsize=None):
-            if tsize is not None:
-                self.total = tsize
-            self.update(b * bsize - self.n)
+    # aria2c uses 16 parallel connections — much faster than a single urllib stream
+    if shutil.which("aria2c"):
+        print(f"Downloading with aria2c (16 connections): {dest.name}")
+        subprocess.run(
+            [
+                "aria2c",
+                "-x", "16",   # 16 parallel connections to same server
+                "-s", "16",   # 16 segments
+                "-k", "10M",  # 10MB chunk size
+                "--file-allocation=none",
+                "-d", str(dest.parent),
+                "-o", dest.name,
+                url,
+            ],
+            check=True,
+        )
+    else:
+        print(f"aria2c not found — falling back to single-connection download.")
+        print("  Install with: sudo apt install aria2   (or brew install aria2 on Mac)")
 
-    with _Bar(unit="B", unit_scale=True, unit_divisor=1024, miniters=1, desc=dest.name) as bar:
-        urllib.request.urlretrieve(url, dest, reporthook=bar.update_to)
+        class _Bar(tqdm):
+            def update_to(self, b=1, bsize=1, tsize=None):
+                if tsize is not None:
+                    self.total = tsize
+                self.update(b * bsize - self.n)
+
+        with _Bar(unit="B", unit_scale=True, unit_divisor=1024, miniters=1, desc=dest.name) as bar:
+            urllib.request.urlretrieve(url, dest, reporthook=bar.update_to)
 
 
 def download_coco(data_dir: Path) -> Path:

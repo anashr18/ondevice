@@ -1,0 +1,32 @@
+model:
+  intern_vit_path:     "OpenGVLab/InternViT-300M-448px"
+  lfm_path:            "LiquidAI/LFM2.5-1.2B-Instruct"
+  lfm_hidden_size:     2048
+  num_query_tokens:    32
+  encoder_hidden_size: 1024
+
+data:
+  train_jsonl:  "data/train.jsonl"
+  val_jsonl:    "data/val.jsonl"
+  max_tiles:    2       # fewer tiles = less memory, faster iteration
+  max_text_len: 128
+
+training:
+  base_batch_size:       2
+  max_patches_per_batch: 4096
+  accum_steps:           2
+  lr:                    1.0e-4
+  weight_decay:          0.01
+  warmup_steps:          5
+  total_steps:           30
+  eval_every:            10
+  log_every:             5
+  output_dir:            "checkpoints/smoke"
+
+frozen:
+  intern_vit:          true
+  lfm_top_n_unfreeze:  0
+
+accelerate:
+  mixed_precision: "bf16"
+  log_with: null

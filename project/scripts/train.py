@@ -18,7 +18,7 @@ from data.dataset import VisionLMDataset
 from data.sampler import TileBucketSampler
 from data.collate import make_collate_fn
 from model.multimodal_model import InternViTQFormerLFM
-from training.trainer import train_one_epoch, evaluate
+from training.trainer import evaluate
 
 
 def cosine_with_warmup(optimizer, warmup_steps: int, total_steps: int) -> LambdaLR:
@@ -30,10 +30,15 @@ def cosine_with_warmup(optimizer, warmup_steps: int, total_steps: int) -> Lambda
     return LambdaLR(optimizer, lr_lambda)
 
 
+def current_lr(optimizer) -> float:
+    return optimizer.param_groups[0]["lr"]
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config",    required=True)
-    parser.add_argument("--max_steps", type=int, default=None, help="Override total_steps (smoke test)")
+    parser.add_argument("--config",     required=True)
+    parser.add_argument("--max_steps",  type=int, default=None, help="Override total_steps (smoke test)")
+    parser.add_argument("--resume_dir", type=str, default=None, help="Path to accelerate save_state dir to resume from")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -46,17 +51,24 @@ def main():
     ac_cfg = cfg.get("accelerate", {})
 
     output_dir = t_cfg["output_dir"]
-    project_cfg = ProjectConfiguration(project_dir=output_dir, logging_dir=os.path.join(output_dir, "logs"))
 
+    # mixed_precision=None means "defer to accelerate launch --config_file or env"
+    # Set it explicitly in finetune.yaml accelerate.mixed_precision to override
     accelerator = Accelerator(
-        mixed_precision=ac_cfg.get("mixed_precision", "bf16"),
+        mixed_precision=ac_cfg.get("mixed_precision"),
         gradient_accumulation_steps=t_cfg["accum_steps"],
-        project_config=project_cfg,
-        log_with=ac_cfg.get("log_with", None),
+        project_config=ProjectConfiguration(
+            project_dir=output_dir,
+            logging_dir=os.path.join(output_dir, "logs"),
+        ),
+        log_with=ac_cfg.get("log_with") or [],
     )
 
     if accelerator.is_main_process:
         os.makedirs(output_dir, exist_ok=True)
+        print(f"Mixed precision: {accelerator.mixed_precision} | "
+              f"Num processes: {accelerator.num_processes} | "
+              f"Device: {accelerator.device}")
 
     tokenizer = AutoTokenizer.from_pretrained(m_cfg["lfm_path"])
     if tokenizer.pad_token_id is None:
@@ -84,66 +96,99 @@ def main():
         lfm_top_n_unfreeze=fr_cfg.get("lfm_top_n_unfreeze", 0),
     )
 
+    total_steps = args.max_steps or t_cfg["total_steps"]
+
     optimizer = AdamW([
-        {"params": list(model.qformer.parameters()),              "lr": t_cfg["lr"]},
-        {"params": [model.query_tokens],                          "lr": t_cfg["lr"]},
-        {"params": list(model.language_projection.parameters()),  "lr": t_cfg["lr"] * 0.1},
+        {"params": list(model.qformer.parameters()),             "lr": t_cfg["lr"]},
+        {"params": [model.query_tokens],                         "lr": t_cfg["lr"]},
+        {"params": list(model.language_projection.parameters()), "lr": t_cfg["lr"] * 0.1},
     ], weight_decay=t_cfg["weight_decay"])
 
-    total_steps = args.max_steps if args.max_steps else t_cfg["total_steps"]
-    scheduler   = cosine_with_warmup(optimizer, t_cfg["warmup_steps"], total_steps)
+    scheduler = cosine_with_warmup(optimizer, t_cfg["warmup_steps"], total_steps)
 
     model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
         model, optimizer, train_loader, val_loader, scheduler
     )
 
+    if args.resume_dir:
+        accelerator.load_state(args.resume_dir)
+
     best_val    = float("inf")
     no_improve  = 0
     global_step = 0
+    log_every   = t_cfg.get("log_every", 20)
+    eval_every  = t_cfg.get("eval_every", 500)
+    epoch       = 0
 
-    for epoch in range(9999):
-        if global_step >= total_steps:
-            break
+    model.train()
 
+    while global_step < total_steps:
         if hasattr(train_loader.batch_sampler, "set_epoch"):
             train_loader.batch_sampler.set_epoch(epoch)
 
-        train_loss = train_one_epoch(accelerator, model, train_loader, optimizer, scheduler, epoch=epoch)
-        # val_loss is already all-reduced inside evaluate() — identical on every rank
-        val_loss = evaluate(accelerator, model, val_loader)
+        for batch in train_loader:
+            if global_step >= total_steps:
+                break
 
-        if accelerator.is_main_process:
-            print(f"Epoch {epoch}: train_loss={train_loss:.4f}  val_loss={val_loss:.4f}")
-
-        if val_loss < best_val:
-            best_val   = val_loss
-            no_improve = 0
-            # Save full training state (model + optimizer + scheduler) for resuming
-            accelerator.save_state(os.path.join(output_dir, "best"))
-            # Also save a plain state-dict for inference (infer.py loads this)
-            if accelerator.is_main_process:
-                unwrapped = accelerator.unwrap_model(model)
-                accelerator.save(
-                    unwrapped.state_dict(),
-                    os.path.join(output_dir, "best_model.pt"),
+            with accelerator.accumulate(model):
+                loss = model(
+                    pixel_values=batch["pixel_values"],
+                    n_tiles_list=batch["n_tiles_list"],
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    labels=batch["labels"],
+                    device=accelerator.device,
                 )
-        else:
-            no_improve += 1
+                accelerator.backward(loss)
 
-        # All ranks must agree on early stopping — broadcast via reduce
-        # no_improve is identical on every rank (val_loss is synced), so any rank works
-        stop_flag = accelerator.reduce(
-            torch.tensor(int(no_improve >= 3), device=accelerator.device),
-            reduction="sum",
-        )
-        if stop_flag.item() > 0:
-            if accelerator.is_main_process:
-                print("Early stopping.")
-            break
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(
+                        [p for p in model.parameters() if p.requires_grad], 1.0
+                    )
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    global_step += 1
 
-        global_step += len(train_loader) // t_cfg["accum_steps"]
+                    if global_step % log_every == 0 and accelerator.is_main_process:
+                        print(f"step={global_step} loss={loss.detach().float().item():.4f} "
+                              f"lr={current_lr(optimizer):.2e}")
+
+                    if global_step % eval_every == 0:
+                        val_loss = evaluate(accelerator, model, val_loader)
+                        model.train()
+
+                        if accelerator.is_main_process:
+                            print(f"step={global_step} val_loss={val_loss:.4f}")
+
+                        if val_loss < best_val:
+                            best_val   = val_loss
+                            no_improve = 0
+                            accelerator.save_state(os.path.join(output_dir, "best"))
+                            if accelerator.is_main_process:
+                                accelerator.save(
+                                    accelerator.unwrap_model(model).state_dict(),
+                                    os.path.join(output_dir, "best_model.pt"),
+                                )
+                        else:
+                            no_improve += 1
+
+                        # All ranks agree on early stopping
+                        stop_flag = accelerator.reduce(
+                            torch.tensor(int(no_improve >= 3), device=accelerator.device),
+                            reduction="sum",
+                        )
+                        if stop_flag.item() > 0:
+                            if accelerator.is_main_process:
+                                print("Early stopping.")
+                            global_step = total_steps  # signal outer while to exit
+                            break
+
+        epoch += 1
 
     accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        print(f"Training done. Best val loss: {best_val:.4f}")
 
 
 if __name__ == "__main__":
