@@ -1,15 +1,16 @@
 import math
 from PIL import Image
 import torch
-import torchvision.transforms as T
 
-_IMAGENET_MEAN = [0.485, 0.456, 0.406]
-_IMAGENET_STD  = [0.229, 0.224, 0.225]
+_IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+_IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
-_transform = T.Compose([
-    T.ToTensor(),
-    T.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
-])
+
+def _to_tensor_normalized(pil_image: Image.Image) -> torch.Tensor:
+    tensor = torch.tensor(bytearray(pil_image.tobytes()), dtype=torch.uint8)
+    tensor = tensor.view(pil_image.size[1], pil_image.size[0], 3).permute(2, 0, 1).float()
+    tensor = tensor.div_(255.0)
+    return (tensor - _IMAGENET_MEAN) / _IMAGENET_STD
 
 
 def find_best_grid(W: int, H: int, max_tiles: int) -> tuple[int, int]:
@@ -20,8 +21,10 @@ def find_best_grid(W: int, H: int, max_tiles: int) -> tuple[int, int]:
         for rows in range(1, max_tiles + 1):
             if cols * rows > max_tiles:
                 continue
-            tile_ar = (W / cols) / (H / rows)
-            cost = abs(math.log(tile_ar / image_ar))
+            # We resize every crop to a square, so we want each tile itself to be
+            # as close to square as possible: (W / cols) / (H / rows) ~= 1.
+            tile_ar = (W * rows) / (H * cols)
+            cost = abs(math.log(tile_ar))
             if cost < best_cost:
                 best_cost = cost
                 best = (cols, rows)
@@ -43,9 +46,9 @@ def dynamic_tile_image(pil_image: Image.Image, max_tiles: int = 6) -> list[torch
             right  = int(round((c + 1) * tile_w))
             lower  = int(round((r + 1) * tile_h))
             tile   = img.crop((left, upper, right, lower)).resize((448, 448), Image.BICUBIC)
-            tiles.append(_transform(tile))
+            tiles.append(_to_tensor_normalized(tile))
 
     thumbnail = img.resize((448, 448), Image.BICUBIC)
-    tiles.append(_transform(thumbnail))
+    tiles.append(_to_tensor_normalized(thumbnail))
 
     return tiles  # each [3, 448, 448]

@@ -8,7 +8,7 @@ model:
 data:
   train_jsonl:  "data/train.jsonl"
   val_jsonl:    "data/val.jsonl"
-  max_tiles:    2       # fewer tiles = less memory, faster iteration
+  max_tiles:    2     
   max_text_len: 128
 
 training:
@@ -28,5 +28,9 @@ frozen:
   lfm_top_n_unfreeze:  0
 
 accelerate:
-  mixed_precision: "bf16"
+  # Mixed precision is managed INSIDE the model:
+  #   - Frozen modules (InternViT, LFM) are loaded in bfloat16
+  #   - Trainable modules (Q-Former, projection, query_tokens) stay in float32
+  # Set to "no" so accelerate doesn't add an autocast that conflicts with our boundary casts.
+  mixed_precision: "no"
   log_with: null

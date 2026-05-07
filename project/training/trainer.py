@@ -15,7 +15,6 @@ def evaluate(accelerator: Accelerator, model, loader) -> float:
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
             labels=batch["labels"],
-            device=accelerator.device,
         )
         n_tokens      = (batch["labels"] != -100).sum().item()
         total_loss   += loss.detach().float().item() * n_tokens
@@ -23,7 +22,7 @@ def evaluate(accelerator: Accelerator, model, loader) -> float:
 
     total_loss_t   = torch.tensor(total_loss,   device=accelerator.device)
     total_tokens_t = torch.tensor(total_tokens, device=accelerator.device)
-    total_loss_t   = accelerator.gather(total_loss_t).sum().item()
-    total_tokens_t = accelerator.gather(total_tokens_t).sum().item()
+    total_loss_t   = accelerator.reduce(total_loss_t, reduction="sum").item()
+    total_tokens_t = accelerator.reduce(total_tokens_t, reduction="sum").item()
 
     return total_loss_t / max(total_tokens_t, 1)

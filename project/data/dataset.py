@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 import torch
 from PIL import Image
@@ -38,8 +37,8 @@ class VisionLMDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         sample = self.samples[idx]
-        img    = Image.open(sample["image_path"])
-        tiles  = dynamic_tile_image(img, self.max_tiles)
+        with Image.open(sample["image_path"]) as img:
+            tiles = dynamic_tile_image(img, self.max_tiles)
         pixel_values = torch.stack(tiles)  # [n_tiles, 3, 448, 448]
         n_tiles      = pixel_values.shape[0]
 

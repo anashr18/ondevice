@@ -32,26 +32,24 @@ def main():
     model.load_state_dict(state_dict)
     model.eval()
 
-    img   = Image.open(args.image)
-    tiles = dynamic_tile_image(img)
-    pixel_values = torch.stack(tiles).unsqueeze(0)  # [1, n_tiles, 3, 448, 448]
+    with Image.open(args.image) as img:
+        tiles = dynamic_tile_image(img)
+    pixel_values = torch.stack(tiles).unsqueeze(0).to(device)  # [1, n_tiles, 3, 448, 448]
     n_tiles_list = [pixel_values.shape[1]]
 
     input_ids = torch.tensor(
         tokenizer(args.question, add_special_tokens=False).input_ids,
         dtype=torch.long,
-    ).unsqueeze(0)
-    attention_mask = torch.ones_like(input_ids)
+    ).unsqueeze(0).to(device)
+    attention_mask = torch.ones_like(input_ids, device=device)
 
-    with torch.no_grad():
-        out_ids = model.generate(
-            pixel_values=pixel_values,
-            n_tiles_list=n_tiles_list,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            device=device,
-            max_new_tokens=args.max_new_tokens,
-        )
+    out_ids = model.generate(
+        pixel_values=pixel_values,
+        n_tiles_list=n_tiles_list,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=args.max_new_tokens,
+    )
 
     print(tokenizer.decode(out_ids[0], skip_special_tokens=True))
 

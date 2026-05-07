@@ -28,7 +28,9 @@ frozen:
   lfm_top_n_unfreeze:  0    # set to 4 to partially unfreeze top LFM layers
 
 accelerate:
-  mixed_precision: "bf16"   # "no" | "fp16" | "bf16"
+  # Mixed precision is managed INSIDE the model (frozen=bf16, trainable=fp32).
+  # Keep "no" here — letting accelerate add autocast on top breaks the boundary casts.
+  mixed_precision: "no"
   log_with: null            # "wandb" | "tensorboard" | null
   # Multi-GPU: accelerate launch --num_processes 4 scripts/train.py --config configs/finetune.yaml
   # FSDP:     accelerate launch --config_file configs/fsdp_config.yaml scripts/train.py ...
