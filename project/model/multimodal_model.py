@@ -91,13 +91,29 @@ class InternViTQFormerLFM(nn.Module):
 
         self._embed_tokens = embed_tokens
 
+    def _input_vocab_size(self) -> int:
+        return self._embed_tokens.num_embeddings
+
+    def _output_vocab_size(self) -> int:
+        output_embeddings = self.lfm.get_output_embeddings()
+        if output_embeddings is not None:
+            if hasattr(output_embeddings, "out_features"):
+                return int(output_embeddings.out_features)
+            if hasattr(output_embeddings, "num_embeddings"):
+                return int(output_embeddings.num_embeddings)
+            if hasattr(output_embeddings, "weight"):
+                return int(output_embeddings.weight.shape[0])
+        return int(getattr(self.lfm.config, "vocab_size"))
+
     def ensure_tokenizer_compatibility(self, tokenizer) -> dict[str, int | bool]:
         tokenizer_vocab_size = len(tokenizer)
-        original_model_vocab_size = self._embed_tokens.num_embeddings
+        original_model_vocab_size = self._input_vocab_size()
+        original_output_vocab_size = self._output_vocab_size()
         model_vocab_size = original_model_vocab_size
+        output_vocab_size = original_output_vocab_size
         resized = False
 
-        if tokenizer_vocab_size > model_vocab_size:
+        if tokenizer_vocab_size > max(model_vocab_size, output_vocab_size):
             self.lfm.resize_token_embeddings(tokenizer_vocab_size)
             self._refresh_input_embeddings()
             for param in self._embed_tokens.parameters():
@@ -108,13 +124,16 @@ class InternViTQFormerLFM(nn.Module):
                 for param in output_embeddings.parameters():
                     param.requires_grad = False
 
-            model_vocab_size = self._embed_tokens.num_embeddings
+            model_vocab_size = self._input_vocab_size()
+            output_vocab_size = self._output_vocab_size()
             resized = True
 
         return {
             "original_model_vocab_size": original_model_vocab_size,
+            "original_output_vocab_size": original_output_vocab_size,
             "tokenizer_vocab_size": tokenizer_vocab_size,
             "model_vocab_size": model_vocab_size,
+            "output_vocab_size": output_vocab_size,
             "resized": resized,
         }
 
@@ -125,12 +144,37 @@ class InternViTQFormerLFM(nn.Module):
         if input_ids.numel() == 0:
             return
 
+        min_token_id = int(input_ids.min().item())
         max_token_id = int(input_ids.max().item())
-        vocab_size = self._embed_tokens.num_embeddings
+        vocab_size = self._input_vocab_size()
+        if min_token_id < 0:
+            raise ValueError(
+                f"Encountered negative token id {min_token_id}. Token ids must be in "
+                f"[0, {vocab_size - 1}] for the LFM input embeddings."
+            )
         if max_token_id >= vocab_size:
             raise ValueError(
                 f"Encountered token id {max_token_id}, but the LFM embedding table "
                 f"has only {vocab_size} rows. Check tokenizer/model compatibility."
+            )
+
+    def _validate_labels(self, labels: torch.Tensor) -> None:
+        valid_labels = labels[labels != -100]
+        if valid_labels.numel() == 0:
+            return
+
+        min_label = int(valid_labels.min().item())
+        max_label = int(valid_labels.max().item())
+        vocab_size = self._output_vocab_size()
+        if min_label < 0:
+            raise ValueError(
+                f"Encountered negative label id {min_label}. Labels must be -100 or in "
+                f"[0, {vocab_size - 1}] for the LFM loss."
+            )
+        if max_label >= vocab_size:
+            raise ValueError(
+                f"Encountered label id {max_label}, but the LFM output head supports "
+                f"only {vocab_size} classes. Check tokenizer/model compatibility."
             )
 
     def encode_images(
@@ -209,6 +253,7 @@ class InternViTQFormerLFM(nn.Module):
 
         # LFM (bf16)
         self._validate_text_token_ids(input_ids)
+        self._validate_labels(labels)
         text_embeds = self._embed_tokens(input_ids)
 
         full_input  = torch.cat([visual_tokens, text_embeds], dim=1)

@@ -225,6 +225,12 @@ def main():
             f"{vocab_info['original_model_vocab_size']} to match tokenizer size "
             f"{vocab_info['tokenizer_vocab_size']}"
         )
+    accelerator.print(
+        "[init] vocab sizes: "
+        f"tokenizer={vocab_info['tokenizer_vocab_size']} "
+        f"input_embeddings={vocab_info['model_vocab_size']} "
+        f"lm_head={vocab_info['output_vocab_size']}"
+    )
 
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
