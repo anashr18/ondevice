@@ -1,4 +1,5 @@
 import argparse
+import json
 import math
 import os
 import sys
@@ -41,6 +42,15 @@ def format_dtype(dtype: torch.dtype | None) -> str:
     return str(dtype).replace("torch.", "")
 
 
+def module_dtype(module) -> torch.dtype | None:
+    if module is None:
+        return None
+    try:
+        return next(module.parameters()).dtype
+    except (AttributeError, StopIteration):
+        return None
+
+
 def describe_runtime(accelerator: Accelerator, model=None) -> list[str]:
     lines = [
         f"accelerator.device={accelerator.device}",
@@ -66,8 +76,8 @@ def describe_runtime(accelerator: Accelerator, model=None) -> list[str]:
         try:
             lines.extend([
                 f"model.device={next(unwrapped.parameters()).device}",
-                f"vision_dtype={format_dtype(getattr(unwrapped.intern_vit, 'model', None).dtype if hasattr(getattr(unwrapped, 'intern_vit', None), 'model') else None)}",
-                f"lfm_dtype={format_dtype(getattr(unwrapped.lfm, 'dtype', None))}",
+                f"vision_dtype={format_dtype(module_dtype(getattr(unwrapped.intern_vit, 'model', None)))}",
+                f"lfm_dtype={format_dtype(module_dtype(unwrapped.lfm))}",
                 f"qformer_dtype={format_dtype(next(unwrapped.qformer.parameters()).dtype)}",
                 f"projector_dtype={format_dtype(next(unwrapped.language_projection.parameters()).dtype)}",
                 f"query_tokens_dtype={format_dtype(unwrapped.query_tokens.dtype)}",
@@ -76,6 +86,39 @@ def describe_runtime(accelerator: Accelerator, model=None) -> list[str]:
             pass
 
     return lines
+
+
+def build_optimizer(model: InternViTQFormerLFM, train_cfg: dict) -> AdamW:
+    param_groups = [
+        {"params": list(model.qformer.parameters()), "lr": train_cfg["lr"]},
+        {"params": [model.query_tokens], "lr": train_cfg["lr"]},
+        {
+            "params": list(model.language_projection.parameters()),
+            "lr": train_cfg.get("projector_lr", train_cfg["lr"] * 0.1),
+        },
+    ]
+
+    lfm_trainable_params = model.trainable_lfm_parameters()
+    if lfm_trainable_params:
+        param_groups.append({
+            "params": lfm_trainable_params,
+            "lr": train_cfg.get("lfm_lr", train_cfg["lr"] * 0.1),
+        })
+
+    return AdamW(param_groups, weight_decay=train_cfg["weight_decay"])
+
+
+def load_training_state(state_path: Path) -> dict:
+    if not state_path.exists():
+        return {}
+    with open(state_path) as f:
+        return json.load(f)
+
+
+def save_training_state(state_path: Path, state: dict) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(state_path, "w") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
 
 
 def resolve_existing_path(path_str: str, config_path: Path) -> Path:
@@ -109,6 +152,8 @@ def main():
     fr_cfg              = cfg.get("frozen", {})
     ac_cfg              = cfg.get("accelerate", {})
     output_dir          = t_cfg["output_dir"]
+    best_ckpt_dir       = Path(output_dir) / "best"
+    best_state_path     = best_ckpt_dir / "trainer_state.json"
 
     # Mixed precision is handled INSIDE the model (frozen=bf16, trainable=fp32).
     # Keep accelerator's mixed_precision="no" so it doesn't add an autocast that
@@ -125,8 +170,10 @@ def main():
 
     if accelerator.is_main_process:
         os.makedirs(output_dir, exist_ok=True)
-        for line in describe_runtime(accelerator):
-            print(f"[init] {line}")
+    accelerator.wait_for_everyone()
+
+    for line in describe_runtime(accelerator):
+        accelerator.print(f"[init] {line}")
 
     tokenizer = AutoTokenizer.from_pretrained(m_cfg["lfm_path"])
     if tokenizer.pad_token_id is None:
@@ -171,47 +218,58 @@ def main():
         lfm_hidden_size=m_cfg["lfm_hidden_size"],
         lfm_top_n_unfreeze=fr_cfg.get("lfm_top_n_unfreeze", 0),
     )
+    vocab_info = model.ensure_tokenizer_compatibility(tokenizer)
+    if vocab_info["resized"]:
+        accelerator.print(
+            "[init] Resized LFM input embeddings from "
+            f"{vocab_info['original_model_vocab_size']} to match tokenizer size "
+            f"{vocab_info['tokenizer_vocab_size']}"
+        )
 
-    if accelerator.is_main_process:
-        n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        n_total = sum(p.numel() for p in model.parameters())
-        print(f"[init] params: trainable={n_train/1e6:.1f}M  total={n_total/1e9:.2f}B")
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_total = sum(p.numel() for p in model.parameters())
+    accelerator.print(f"[init] params: trainable={n_train/1e6:.1f}M  total={n_total/1e9:.2f}B")
 
     total_steps = args.max_steps or t_cfg["total_steps"]
+    eval_every = t_cfg.get("eval_every", 500)
+    log_every = t_cfg.get("log_every", 20)
+    early_stopping_patience = t_cfg.get("early_stopping_patience", 3)
 
-    optimizer = AdamW([
-        {"params": list(model.qformer.parameters()),             "lr": t_cfg["lr"]},
-        {"params": [model.query_tokens],                         "lr": t_cfg["lr"]},
-        {"params": list(model.language_projection.parameters()), "lr": t_cfg["lr"] * 0.1},
-    ], weight_decay=t_cfg["weight_decay"])
+    optimizer = build_optimizer(model, t_cfg)
     scheduler = cosine_with_warmup(optimizer, t_cfg["warmup_steps"], total_steps)
 
     model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
         model, optimizer, train_loader, val_loader, scheduler
     )
 
-    if accelerator.is_main_process:
-        for line in describe_runtime(accelerator, model):
-            print(f"[runtime] {line}")
+    for line in describe_runtime(accelerator, model):
+        accelerator.print(f"[runtime] {line}")
 
     # Capture trainable params AFTER prepare (DDP wraps modules)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
 
+    best_val = float("inf")
+    no_improve = 0
+    global_step = 0
+    epoch = 0
+
     if args.resume_dir:
         accelerator.load_state(args.resume_dir)
-
-    best_val    = float("inf")
-    no_improve  = 0
-    global_step = 0
-    log_every   = t_cfg.get("log_every",  20)
-    eval_every  = t_cfg.get("eval_every", 500)
-    epoch       = 0
+        resume_state = load_training_state(Path(args.resume_dir) / "trainer_state.json")
+        if resume_state:
+            best_val = float(resume_state.get("best_val", best_val))
+            no_improve = int(resume_state.get("no_improve", no_improve))
+            global_step = int(resume_state.get("global_step", global_step))
+            epoch = int(resume_state.get("epoch", epoch))
+        accelerator.print(
+            f"[resume] dir={args.resume_dir} step={global_step} "
+            f"epoch={epoch} best_val={best_val:.4f}"
+        )
 
     model.train()
 
     while global_step < total_steps:
-        if hasattr(train_loader, "batch_sampler") and hasattr(train_loader.batch_sampler, "set_epoch"):
-            train_loader.batch_sampler.set_epoch(epoch)
+        train_sampler.set_epoch(epoch)
 
         for batch in train_loader:
             if global_step >= total_steps:
@@ -230,50 +288,60 @@ def main():
                     accelerator.clip_grad_norm_(trainable_params, 1.0)
                 optimizer.step()
                 scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
             # Counters / logging / eval only fire on the *real* step
             if accelerator.sync_gradients:
                 global_step += 1
 
-                if global_step % log_every == 0 and accelerator.is_main_process:
-                    print(f"step={global_step:>5d}  loss={loss.detach().float().item():.4f}  "
-                          f"lr={current_lr(optimizer):.2e}")
+                if global_step % log_every == 0:
+                    reduced_loss = accelerator.reduce(
+                        loss.detach().float(),
+                        reduction="mean",
+                    ).item()
+                    accelerator.print(
+                        f"step={global_step:>5d}  loss={reduced_loss:.4f}  "
+                        f"lr={current_lr(optimizer):.2e}"
+                    )
 
                 if global_step % eval_every == 0 or global_step == total_steps:
                     val_loss = evaluate(accelerator, model, val_loader)
-                    model.train()
-
-                    if accelerator.is_main_process:
-                        print(f"step={global_step:>5d}  val_loss={val_loss:.4f}")
+                    accelerator.print(f"step={global_step:>5d}  val_loss={val_loss:.4f}")
 
                     if val_loss < best_val:
-                        best_val   = val_loss
+                        best_val = val_loss
                         no_improve = 0
-                        accelerator.save_state(os.path.join(output_dir, "best"))
+                        accelerator.save_state(str(best_ckpt_dir))
                         if accelerator.is_main_process:
+                            save_training_state(
+                                best_state_path,
+                                {
+                                    "best_val": best_val,
+                                    "epoch": epoch,
+                                    "global_step": global_step,
+                                    "no_improve": no_improve,
+                                },
+                            )
                             accelerator.save(
-                                accelerator.unwrap_model(model).state_dict(),
+                                accelerator.get_state_dict(model),
                                 os.path.join(output_dir, "best_model.pt"),
                             )
+                        accelerator.wait_for_everyone()
                     else:
                         no_improve += 1
 
-                    stop_flag = accelerator.reduce(
-                        torch.tensor(int(no_improve >= 3), device=accelerator.device),
-                        reduction="sum",
-                    )
-                    if stop_flag.item() > 0:
-                        if accelerator.is_main_process:
-                            print("Early stopping.")
+                    if no_improve >= early_stopping_patience:
+                        accelerator.print("Early stopping.")
                         global_step = total_steps
+                        model.train()
                         break
+
+                    model.train()
 
         epoch += 1
 
     accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
-        print(f"Training done. Best val loss: {best_val:.4f}")
+    accelerator.print(f"Training done. Best val loss: {best_val:.4f}")
 
 
 if __name__ == "__main__":

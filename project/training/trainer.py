@@ -4,9 +4,10 @@ from accelerate import Accelerator
 
 @torch.no_grad()
 def evaluate(accelerator: Accelerator, model, loader) -> float:
+    was_training = model.training
     model.eval()
-    total_loss   = 0.0
-    total_tokens = 0
+    total_loss = torch.zeros((), device=accelerator.device, dtype=torch.float64)
+    total_tokens = torch.zeros((), device=accelerator.device, dtype=torch.float64)
 
     for batch in loader:
         loss = model(
@@ -16,13 +17,14 @@ def evaluate(accelerator: Accelerator, model, loader) -> float:
             attention_mask=batch["attention_mask"],
             labels=batch["labels"],
         )
-        n_tokens      = (batch["labels"] != -100).sum().item()
-        total_loss   += loss.detach().float().item() * n_tokens
+        n_tokens = (batch["labels"] != -100).sum().to(torch.float64)
+        total_loss += loss.detach().to(torch.float64) * n_tokens
         total_tokens += n_tokens
 
-    total_loss_t   = torch.tensor(total_loss,   device=accelerator.device)
-    total_tokens_t = torch.tensor(total_tokens, device=accelerator.device)
-    total_loss_t   = accelerator.reduce(total_loss_t, reduction="sum").item()
-    total_tokens_t = accelerator.reduce(total_tokens_t, reduction="sum").item()
+    total_loss = accelerator.reduce(total_loss, reduction="sum")
+    total_tokens = accelerator.reduce(total_tokens, reduction="sum")
 
-    return total_loss_t / max(total_tokens_t, 1)
+    if was_training:
+        model.train()
+
+    return (total_loss / total_tokens.clamp_min(1.0)).item()

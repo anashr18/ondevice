@@ -28,6 +28,7 @@ def main():
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     model = InternViTQFormerLFM(lfm_path=args.lfm_path).to(device)
+    model.ensure_tokenizer_compatibility(tokenizer)
     state_dict = torch.load(args.checkpoint, map_location=device, weights_only=True)
     model.load_state_dict(state_dict)
     model.eval()
@@ -43,13 +44,14 @@ def main():
     ).unsqueeze(0).to(device)
     attention_mask = torch.ones_like(input_ids, device=device)
 
-    out_ids = model.generate(
-        pixel_values=pixel_values,
-        n_tiles_list=n_tiles_list,
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        max_new_tokens=args.max_new_tokens,
-    )
+    with torch.inference_mode():
+        out_ids = model.generate(
+            pixel_values=pixel_values,
+            n_tiles_list=n_tiles_list,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=args.max_new_tokens,
+        )
 
     print(tokenizer.decode(out_ids[0], skip_special_tokens=True))
 

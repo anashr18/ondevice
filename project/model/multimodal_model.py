@@ -28,22 +28,30 @@ class InternViTQFormerLFM(nn.Module):
         frozen_dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
-        self.frozen_dtype     = frozen_dtype
+        self.frozen_dtype = frozen_dtype
         self.num_query_tokens = num_query_tokens
+        self.encoder_hidden_size = encoder_hidden_size
+        self.qformer_hidden_size = 768
+        self.lfm_hidden_size = lfm_hidden_size
 
         # Frozen vision encoder (bf16 inside InternViTEncoder)
         self.intern_vit = InternViTEncoder(intern_vit_path)
 
         # Trainable: Q-Former (fp32)
         qformer_config = QFormerConfig(encoder_hidden_size=encoder_hidden_size)
-        self.qformer   = QFormerModel.from_bert_pretrained(qformer_config)
+        self.qformer = QFormerModel.from_bert_pretrained(qformer_config)
 
         # Trainable: query tokens (fp32)
-        self.query_tokens = nn.Parameter(torch.zeros(1, num_query_tokens, 768))
+        self.query_tokens = nn.Parameter(
+            torch.zeros(1, num_query_tokens, self.qformer_hidden_size)
+        )
         nn.init.trunc_normal_(self.query_tokens, std=0.02)
 
         # Trainable: language projection (fp32)
-        self.language_projection = LanguageProjection(768, lfm_hidden_size)
+        self.language_projection = LanguageProjection(
+            self.qformer_hidden_size,
+            self.lfm_hidden_size,
+        )
 
         # Frozen LFM (bf16)
         self.lfm = AutoModelForCausalLM.from_pretrained(lfm_path, torch_dtype=frozen_dtype)
@@ -51,27 +59,79 @@ class InternViTQFormerLFM(nn.Module):
             p.requires_grad = False
 
         if lfm_top_n_unfreeze > 0:
-            inner  = getattr(self.lfm, "model", self.lfm)
+            inner = getattr(self.lfm, "model", self.lfm)
             layers = getattr(inner, "layers", None) or getattr(inner, "blocks", [])
             for layer in list(layers)[-lfm_top_n_unfreeze:]:
                 for p in layer.parameters():
                     p.requires_grad = True
 
-        # Resolve embedding callable once
-        inner = getattr(self.lfm, "model", self.lfm)
-        self._embed_tokens = (
-            getattr(inner, "embed_tokens",    None)
-            or getattr(inner, "tok_embeddings",  None)
-            or getattr(inner, "token_embedding", None)
-        )
-        if self._embed_tokens is None:
-            raise AttributeError(
-                f"Cannot find embedding layer in {type(self.lfm).__name__}"
-            )
+        self._refresh_input_embeddings()
 
     @property
     def device(self) -> torch.device:
         return self.query_tokens.device
+
+    def _refresh_input_embeddings(self) -> None:
+        embed_tokens = None
+        if hasattr(self.lfm, "get_input_embeddings"):
+            embed_tokens = self.lfm.get_input_embeddings()
+
+        if embed_tokens is None:
+            inner = getattr(self.lfm, "model", self.lfm)
+            embed_tokens = (
+                getattr(inner, "embed_tokens", None)
+                or getattr(inner, "tok_embeddings", None)
+                or getattr(inner, "token_embedding", None)
+            )
+
+        if embed_tokens is None:
+            raise AttributeError(
+                f"Cannot find input embeddings in {type(self.lfm).__name__}"
+            )
+
+        self._embed_tokens = embed_tokens
+
+    def ensure_tokenizer_compatibility(self, tokenizer) -> dict[str, int | bool]:
+        tokenizer_vocab_size = len(tokenizer)
+        original_model_vocab_size = self._embed_tokens.num_embeddings
+        model_vocab_size = original_model_vocab_size
+        resized = False
+
+        if tokenizer_vocab_size > model_vocab_size:
+            self.lfm.resize_token_embeddings(tokenizer_vocab_size)
+            self._refresh_input_embeddings()
+            for param in self._embed_tokens.parameters():
+                param.requires_grad = False
+
+            output_embeddings = self.lfm.get_output_embeddings()
+            if output_embeddings is not None:
+                for param in output_embeddings.parameters():
+                    param.requires_grad = False
+
+            model_vocab_size = self._embed_tokens.num_embeddings
+            resized = True
+
+        return {
+            "original_model_vocab_size": original_model_vocab_size,
+            "tokenizer_vocab_size": tokenizer_vocab_size,
+            "model_vocab_size": model_vocab_size,
+            "resized": resized,
+        }
+
+    def trainable_lfm_parameters(self) -> list[nn.Parameter]:
+        return [p for p in self.lfm.parameters() if p.requires_grad]
+
+    def _validate_text_token_ids(self, input_ids: torch.Tensor) -> None:
+        if input_ids.numel() == 0:
+            return
+
+        max_token_id = int(input_ids.max().item())
+        vocab_size = self._embed_tokens.num_embeddings
+        if max_token_id >= vocab_size:
+            raise ValueError(
+                f"Encountered token id {max_token_id}, but the LFM embedding table "
+                f"has only {vocab_size} rows. Check tokenizer/model compatibility."
+            )
 
     def encode_images(
         self,
@@ -79,28 +139,36 @@ class InternViTQFormerLFM(nn.Module):
         n_tiles_list: list[int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         device = self.device
-        B      = pixel_values.shape[0]
+        B = pixel_values.shape[0]
 
         # Gather real tiles (skip padding) -> bf16 for ViT
         flat_tiles = torch.cat(
             [pixel_values[b, :n_tiles_list[b]] for b in range(B)], dim=0
         ).to(dtype=self.frozen_dtype)
 
-        all_patch_feats = self.intern_vit(flat_tiles)  # bf16: [sum(n), 1024, 1024]
+        all_patch_feats = self.intern_vit(flat_tiles)
+        n_patches_per_tile = all_patch_feats.shape[1]
+        hidden_size = all_patch_feats.shape[2]
 
         # Per-image flatten
         image_feats = []
         offset = 0
         for b in range(B):
-            n     = n_tiles_list[b]
+            n = n_tiles_list[b]
             feats = all_patch_feats[offset:offset + n]
-            image_feats.append(feats.reshape(n * 1024, 1024))
+            image_feats.append(feats.reshape(n * n_patches_per_tile, hidden_size))
             offset += n
 
         # Pad to N_max — UPCAST to fp32 here for Q-Former
-        N_max            = max(f.shape[0] for f in image_feats)
-        img_feats_padded = torch.zeros(B, N_max, 1024, device=device, dtype=torch.float32)
-        img_attn_mask    = torch.zeros(B, 1, 1, N_max, device=device, dtype=torch.float32)
+        N_max = max(f.shape[0] for f in image_feats)
+        img_feats_padded = torch.zeros(
+            B,
+            N_max,
+            hidden_size,
+            device=device,
+            dtype=torch.float32,
+        )
+        img_attn_mask = torch.zeros(B, 1, 1, N_max, device=device, dtype=torch.float32)
         for b, feats in enumerate(image_feats):
             N = feats.shape[0]
             img_feats_padded[b, :N] = feats.float()
@@ -120,7 +188,7 @@ class InternViTQFormerLFM(nn.Module):
         **_,
     ) -> torch.Tensor:
         device = self.device
-        B      = pixel_values.shape[0]
+        B = pixel_values.shape[0]
 
         # ViT (bf16) -> img_feats (fp32)
         img_feats, img_mask = self.encode_images(pixel_values, n_tiles_list)
@@ -140,7 +208,8 @@ class InternViTQFormerLFM(nn.Module):
         visual_tokens = self.language_projection(query_out).to(dtype=self.frozen_dtype)
 
         # LFM (bf16)
-        text_embeds = self._embed_tokens(input_ids)  # already in frozen_dtype
+        self._validate_text_token_ids(input_ids)
+        text_embeds = self._embed_tokens(input_ids)
 
         full_input  = torch.cat([visual_tokens, text_embeds], dim=1)
         full_attn   = torch.cat([
@@ -170,7 +239,7 @@ class InternViTQFormerLFM(nn.Module):
         **_,
     ) -> torch.Tensor:
         device = self.device
-        B      = pixel_values.shape[0]
+        B = pixel_values.shape[0]
 
         img_feats, img_mask = self.encode_images(pixel_values, n_tiles_list)
 
@@ -189,6 +258,7 @@ class InternViTQFormerLFM(nn.Module):
         query_out     = qformer_out[:, :self.num_query_tokens, :]
         visual_tokens = self.language_projection(query_out).to(dtype=self.frozen_dtype)
 
+        self._validate_text_token_ids(input_ids)
         text_embeds = self._embed_tokens(input_ids)
         full_input  = torch.cat([visual_tokens, text_embeds], dim=1)
         full_attn   = torch.cat([
